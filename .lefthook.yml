@@ -1,7 +1,5 @@
 pre-commit:
   commands:
-    lychee:
-      run: lychee . --suggest --max-concurrency 32 --cache --exclude toptal --format detailed --max-cache-age 7d
     isort:
       files: git ls-files
       glob: '*.{py}'
@@ -18,3 +16,8 @@ pre-commit:
     mypy:
       glob: '*.py'
       run: mypy {staged_files} --ignore-missing-imports
+    clean-jupyter:
+      files: git ls-files
+      glob: '*.ipynb'
+      run: uv run jupyter nbconvert --clear-output --inplace {staged_files}
+      stage_fixed: true
