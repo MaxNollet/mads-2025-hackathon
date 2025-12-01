@@ -761,3 +761,5 @@ FodyWeavers.xsd
 config.toml
 data/*
 models/*
+assets/*
+artefacts/*
