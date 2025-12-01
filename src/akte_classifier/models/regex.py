@@ -86,7 +86,7 @@ class RegexGenerator:
             for p in parts:
                 escaped = re.escape(p)
                 # Flexible whitespace
-                escaped = escaped.replace(r"\ ", r"\s+")
+                escaped = escaped.replace(r"\ ", r"\s{1,5}")
                 pattern_parts.append(escaped)
 
             # Combine with .* to match in order, allowing anything in between
@@ -95,7 +95,7 @@ class RegexGenerator:
             # Standard handling
             escaped = re.escape(clean_desc)
             # Flexible whitespace
-            pattern = escaped.replace(r"\ ", r"\s+")
+            pattern = escaped.replace(r"\ ", r"\s{1,5}")
 
         return pattern
 
@@ -172,11 +172,15 @@ class RegexVectorizer:
         from joblib import Parallel, delayed
 
         batch_size = len(texts)
-        features = torch.zeros((batch_size, self.output_dim), dtype=torch.float32)
+        features = torch.zeros(
+            (batch_size, self.output_dim), dtype=torch.float32
+        )
 
         # Parallelize the matching process
         # n_jobs=-1 uses all available cores
-        results = Parallel(n_jobs=-1)(delayed(self._match_text)(text) for text in texts)
+        results = Parallel(n_jobs=-1)(
+            delayed(self._match_text)(text) for text in texts
+        )
 
         for i, matched_indices in enumerate(results):
             if matched_indices:
