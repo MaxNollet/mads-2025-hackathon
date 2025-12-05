@@ -133,7 +133,74 @@ class TextVectorizer:
     @property
     def hidden_size(self) -> int:
         return self.model.config.hidden_size
+'''
 
+class TextVectorizer(nn.Module): # Let op: inherit nu van nn.Module voor de extra weights
+    """
+    Wraps a HuggingFace model with Attention Pooling.
+    """
+
+    def __init__(
+        self, model_name: str, max_length: int | None = None, pooling: str | None = None
+    ):
+        super().__init__() # Belangrijk voor nn.Module
+        self.model_name = model_name
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.model = AutoModel.from_pretrained(model_name)
+        
+        # --- Nieuw: Attention Weights ---
+        # We leren een vector die bepaalt hoe belangrijk elk hidden state is
+        self.attention_weights = nn.Linear(self.model.config.hidden_size, 1)
+        
+        # Determine max_length logic (hetzelfde als je had)
+        if max_length is not None:
+            self.max_length = max_length
+        else:
+            model_max_len = self.tokenizer.model_max_length
+            self.max_length = 512 if model_max_len > 10000 else model_max_len
+
+    def forward(self, texts: list[str]) -> torch.Tensor:
+        # Tokenize
+        inputs = self.tokenizer(
+            texts,
+            padding=True,
+            truncation=True,
+            max_length=self.max_length,
+            return_tensors="pt",
+        )
+
+        device = next(self.model.parameters()).device
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+
+        # Forward pass door BERT
+        outputs = self.model(**inputs)
+        
+        # last_hidden_state: (batch, seq_len, hidden_size)
+        hidden_states = outputs.last_hidden_state 
+        attention_mask = inputs["attention_mask"] # (batch, seq_len)
+
+        # --- Attention Pooling Logic ---
+        # 1. Bereken raw attention scores voor elk woord
+        # shape: (batch, seq_len, 1)
+        attn_scores = self.attention_weights(hidden_states) 
+        
+        # 2. Maskeer padding tokens (geef ze -oneindig score zodat softmax ze negeert)
+        attn_scores = attn_scores.squeeze(-1) # (batch, seq_len)
+        attn_scores = attn_scores.masked_fill(attention_mask == 0, -1e9)
+        
+        # 3. Softmax om kansverdeling te krijgen (alles telt op tot 1)
+        attn_weights = torch.softmax(attn_scores, dim=1).unsqueeze(-1) # (batch, seq_len, 1)
+        
+        # 4. Gewogen som van de hidden states
+        # (batch, seq_len, hidden) * (batch, seq_len, 1) -> sum over seq_len
+        weighted_embeddings = torch.sum(hidden_states * attn_weights, dim=1)
+        
+        return weighted_embeddings
+
+    @property
+    def hidden_size(self) -> int:
+        return self.model.config.hidden_size
+'''
 
 class NeuralClassifier(nn.Module):
     """
@@ -158,37 +225,179 @@ class NeuralClassifier(nn.Module):
         x = self.sequential(x)
         return x
 
+import torch
+import torch.nn as nn
+from loguru import logger
+
+class ResidualBlock(nn.Module):
+    def __init__(self, hidden_dim: int, dropout: float = 0.3): # Dropout verhoogd!
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout) 
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.block(x)
+
 
 class HybridClassifier(nn.Module):
-    """
-    A classifier that combines text embeddings and regex features.
-    """
-
     def __init__(
-        self, input_dim: int, regex_dim: int, num_classes: int, hidden_dim: int = 128
+        self, 
+        input_dim: int, 
+        regex_dim: int, 
+        num_classes: int, 
+        hidden_dim: int = 128,  # Terug naar 128 (compacter)
+        num_res_blocks: int = 1  # Terug naar 1 (minder complexiteit)
     ):
         super().__init__()
+        
+        # Branch dimensions
+        text_hidden = hidden_dim
+        regex_hidden = hidden_dim
 
-        # Concatenated input dimension
-        combined_dim = input_dim + regex_dim
-        logger.info(f"Combined dimension: {combined_dim}")
+        # --- 1. Tekst Branch ---
+        self.text_input = nn.Sequential(
+            nn.Linear(input_dim, text_hidden),
+            nn.BatchNorm1d(text_hidden),
+            nn.ReLU(),
+            nn.Dropout(0.3) # Extra dropout aan het begin
+        )
+        self.text_res_blocks = nn.Sequential(
+            *[ResidualBlock(text_hidden, dropout=0.3) for _ in range(num_res_blocks)]
+        )
 
-        self.sequential = nn.Sequential(
-            nn.Linear(combined_dim, hidden_dim),
+        # --- 2. Regex Branch ---
+        self.regex_input = nn.Sequential(
+            nn.Linear(regex_dim, regex_hidden),
+            nn.BatchNorm1d(regex_hidden),
             nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.Dropout(0.3)
+        )
+        self.regex_res_blocks = nn.Sequential(
+            *[ResidualBlock(regex_hidden, dropout=0.3) for _ in range(num_res_blocks)]
+        )
+
+        # --- 3. Fusion ---
+        combined_dim = text_hidden + regex_hidden
+        
+        # Fusion Layer
+        self.classifier = nn.Sequential(
+            nn.LayerNorm(combined_dim), # Belangrijk: Normaliseer na samenvoegen
+            nn.Linear(combined_dim, combined_dim // 2),
             nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim, num_classes),
+            nn.Dropout(0.3), # Hoge dropout voor de finale beslissing
+            nn.Linear(combined_dim // 2, num_classes)
         )
 
     def forward(
         self, text_emb: torch.Tensor, regex_feats: torch.Tensor
     ) -> torch.Tensor:
-        """
-        Forward pass. Concatenates inputs and returns logits.
-        """
-        # Concatenate along the feature dimension (dim=1)
-        combined = torch.cat((text_emb, regex_feats), dim=1)
-        x = self.sequential(combined)
-        return x
+        
+        x_text = self.text_input(text_emb)
+        x_text = self.text_res_blocks(x_text)
+
+        x_regex = self.regex_input(regex_feats)
+        x_regex = self.regex_res_blocks(x_regex)
+
+        # Concatenate
+        combined = torch.cat((x_text, x_regex), dim=1)
+
+        logits = self.classifier(combined)
+        return logits
+'''
+class ResidualBlock(nn.Module):
+    def __init__(self, hidden_dim: int, dropout: float = 0.3):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout) 
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.block(x)
+
+
+class HybridClassifier(nn.Module):
+    """
+    Gated Fusion Hybrid Classifier.
+    """
+    def __init__(
+        self, 
+        input_dim: int, 
+        regex_dim: int, 
+        num_classes: int, 
+        hidden_dim: int = 128, 
+        num_res_blocks: int = 1
+    ):
+        super().__init__()
+        
+        # Branch dimensions
+        text_hidden = hidden_dim
+        regex_hidden = hidden_dim
+
+        # --- 1. Tekst Branch (Deze ontbrak net) ---
+        self.text_input = nn.Sequential(
+            nn.Linear(input_dim, text_hidden),
+            nn.BatchNorm1d(text_hidden),
+            nn.ReLU(),
+            nn.Dropout(0.3)
+        )
+        self.text_res_blocks = nn.Sequential(
+            *[ResidualBlock(text_hidden, dropout=0.3) for _ in range(num_res_blocks)]
+        )
+
+        # --- 2. Regex Branch (Deze ontbrak net) ---
+        self.regex_input = nn.Sequential(
+            nn.Linear(regex_dim, regex_hidden),
+            nn.BatchNorm1d(regex_hidden),
+            nn.ReLU(),
+            nn.Dropout(0.3)
+        )
+        self.regex_res_blocks = nn.Sequential(
+            *[ResidualBlock(regex_hidden, dropout=0.3) for _ in range(num_res_blocks)]
+        )
+
+        # --- 3. Gated Fusion ---
+        combined_dim = text_hidden + regex_hidden
+        
+        # De 'Gate' berekent een weging tussen 0 en 1 voor elk feature
+        self.gate_layer = nn.Sequential(
+            nn.Linear(combined_dim, combined_dim),
+            nn.Sigmoid()
+        )
+        
+        self.classifier = nn.Sequential(
+            nn.LayerNorm(combined_dim),
+            nn.Linear(combined_dim, combined_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(combined_dim // 2, num_classes)
+        )
+
+    def forward(self, text_emb: torch.Tensor, regex_feats: torch.Tensor) -> torch.Tensor:
+        # 1. Branches verwerken
+        x_text = self.text_input(text_emb)
+        x_text = self.text_res_blocks(x_text)
+
+        x_regex = self.regex_input(regex_feats)
+        x_regex = self.regex_res_blocks(x_regex)
+
+        # 2. Concatenate
+        combined_raw = torch.cat((x_text, x_regex), dim=1)
+        
+        # 3. Gated Mechanism
+        # We kijken naar de gecombineerde features en bepalen wat we belangrijk vinden
+        gate = self.gate_layer(combined_raw)
+        
+        # Element-wise vermenigvuldiging: filtert ruis weg op basis van de gate
+        gated_features = combined_raw * gate 
+        
+        # 4. Classify
+        logits = self.classifier(gated_features)
+        return logits
+'''

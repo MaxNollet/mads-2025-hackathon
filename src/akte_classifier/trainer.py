@@ -17,6 +17,8 @@ from akte_classifier.datasets.dataset import DatasetFactory
 from akte_classifier.models.llm import LLMClassifier
 from akte_classifier.models.neural import (HybridClassifier, NeuralClassifier,
                                            TextVectorizer)
+# VOEG DEZE REGEL TOE:
+from akte_classifier.models.nebius import NebiusTextVectorizer
 from akte_classifier.models.prompts import ClassificationPromptTemplate
 from akte_classifier.models.regex import RegexGenerator, RegexVectorizer
 from akte_classifier.utils.data import get_long_tail_labels, load_descriptions
@@ -49,12 +51,12 @@ class TrainingConfig:
     device: str = get_default_device()
     model_class: str = "HybridClassifier"  # Default to Hybrid
     use_regex: bool = True  # Whether to use regex features
-    hidden_dim: int = 256  # Hidden layer dimension
+    hidden_dim: int = 512  # Hidden layer dimension
     max_length: Optional[int] = None  # Max token length (None = auto)
     pooling: Optional[str] = None  # Pooling strategy: "mean", "cls", or None (auto)
     long_tail_threshold: Optional[int] = None  # Threshold for long-tail labels
     experiment_name: str = "kadaster_experiment"  # MLFlow experiment name
-    patience: int = 5
+    patience: int = 10
     min_delta: float = 0.001
 
 
@@ -100,15 +102,23 @@ class Trainer:
 
         # Initialize Text Vectorizer
         if self.config.model_class in ["NeuralClassifier", "HybridClassifier"]:
-            self.vectorizer = TextVectorizer(
-                self.config.model_name,
-                max_length=self.config.max_length,
-                pooling=self.config.pooling,
-            )
-            self.vectorizer.model.to(self.device)
-            for param in self.vectorizer.model.parameters():
-                param.requires_grad = False
-            logger.info("Intialized TextVectorizer & freezing weights...")
+            # CHECK: Gebruiken we een Nebius/API model?
+            if "nebius" in self.config.model_name.lower() or "bge" in self.config.model_name.lower():
+                logger.info(f"Initializing Nebius API Vectorizer for {self.config.model_name}...")
+                self.vectorizer = NebiusTextVectorizer(model_name=self.config.model_name)
+                self.vectorizer.to(self.device)
+            else:
+                # OUDE LOGICA: Lokaal HuggingFace model
+                self.vectorizer = TextVectorizer(
+                    self.config.model_name,
+                    max_length=self.config.max_length,
+                    pooling=self.config.pooling,
+                )
+                self.vectorizer.model.to(self.device)
+                for param in self.vectorizer.model.parameters():
+                    param.requires_grad = False
+            
+            logger.info("Initialized TextVectorizer...")
         else:
             logger.info("Skipping TextVectorizer initialization...")
             self.vectorizer = None
@@ -431,14 +441,20 @@ class Trainer:
 
         # 3. Initialize Models
         if self.config.model_class in ["NeuralClassifier", "HybridClassifier"]:
-            self.vectorizer = TextVectorizer(
-                self.config.model_name,
-                max_length=self.config.max_length,
-                pooling=self.config.pooling,
-            )
-            self.vectorizer.model.to(self.device)
-            for param in self.vectorizer.model.parameters():
-                param.requires_grad = False
+            # CHECK: API vs Lokaal (dezelfde logica als hierboven)
+            if "nebius" in self.config.model_name.lower() or "bge" in self.config.model_name.lower():
+                logger.info(f"Initializing Nebius API Vectorizer for evaluation: {self.config.model_name}")
+                self.vectorizer = NebiusTextVectorizer(model_name=self.config.model_name)
+                self.vectorizer.to(self.device)
+            else:
+                self.vectorizer = TextVectorizer(
+                    self.config.model_name,
+                    max_length=self.config.max_length,
+                    pooling=self.config.pooling,
+                )
+                self.vectorizer.model.to(self.device)
+                for param in self.vectorizer.model.parameters():
+                    param.requires_grad = False
         else:
             self.vectorizer = None
 
